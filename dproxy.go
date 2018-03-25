@@ -1,68 +1,83 @@
 package main
 
 import (
-	"bytes"
-	"fmt"
+	"crypto/tls"
+	"flag"
 	"io"
 	"log"
 	"net"
-	"net/url"
-	"strings"
+	"net/http"
+	"time"
 )
 
-func main() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	l, err := net.Listen("tcp", ":8081")
+func handleTunneling(w http.ResponseWriter, r *http.Request) {
+	dest_conn, err := net.DialTimeout("tcp", r.Host, 10*time.Second)
 	if err != nil {
-		log.Panic(err)
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
 	}
-	for {
-		client, err := l.Accept()
-		if err != nil {
-			log.Panic(err)
+	w.WriteHeader(http.StatusOK)
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
+		return
+	}
+	client_conn, _, err := hijacker.Hijack()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+	}
+	go transfer(dest_conn, client_conn)
+	go transfer(client_conn, dest_conn)
+}
+func transfer(destination io.WriteCloser, source io.ReadCloser) {
+	defer destination.Close()
+	defer source.Close()
+	io.Copy(destination, source)
+}
+func handleHTTP(w http.ResponseWriter, req *http.Request) {
+	resp, err := http.DefaultTransport.RoundTrip(req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	defer resp.Body.Close()
+	copyHeader(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+}
+func copyHeader(dst, src http.Header) {
+	for k, vv := range src {
+		for _, v := range vv {
+			dst.Add(k, v)
 		}
-		go handleClientRequest(client)
 	}
 }
-func handleClientRequest(client net.Conn) {
-	if client == nil {
-		return
+func main() {
+	var pemPath string
+	flag.StringVar(&pemPath, "pem", "server.pem", "path to pem file")
+	var keyPath string
+	flag.StringVar(&keyPath, "key", "server.key", "path to key file")
+	var proto string
+	flag.StringVar(&proto, "proto", "https", "Proxy protocol (http or https)")
+	flag.Parse()
+	if proto != "http" && proto != "https" {
+		log.Fatal("Protocol must be either http or https")
 	}
-	defer client.Close()
-	var b [1024]byte
-	n, err := client.Read(b[:])
-	if err != nil {
-		log.Println(err)
-		return
+	server := &http.Server{
+		Addr: ":443",
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodConnect {
+				handleTunneling(w, r)
+			} else {
+				handleHTTP(w, r)
+			}
+		}),
+		// Disable HTTP/2.
+		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
 	}
-	var method, host, address string
-	fmt.Sscanf(string(b[:bytes.IndexByte(b[:], '\n')]), "%s%s", &method, &host)
-	hostPortURL, err := url.Parse(host)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-	if hostPortURL.Opaque == "443" { //https访问
-		address = hostPortURL.Scheme + ":443"
-	} else { //http访问
-		if strings.Index(hostPortURL.Host, ":") == -1 { //host不带端口， 默认80
-			address = hostPortURL.Host + ":80"
-		} else {
-			address = hostPortURL.Host
-		}
-	}
-	//获得了请求的host和port，就开始拨号吧
-	server, err := net.Dial("tcp", address)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-	if method == "CONNECT" {
-		fmt.Fprint(client, "HTTP/1.1 200 Connection established\r\n\r\n")
+	if proto == "http" {
+		log.Fatal(server.ListenAndServe())
 	} else {
-		server.Write(b[:n])
+		log.Fatal(server.ListenAndServeTLS(pemPath, keyPath))
 	}
-	//进行转发
-	go io.Copy(server, client)
-	io.Copy(client, server)
 }
