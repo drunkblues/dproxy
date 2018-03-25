@@ -17,3 +17,7 @@ openssl req \
         <(printf '[SAN]\nsubjectAltName=DNS:localhost')) \
     -sha256 \
     -days 3650
+
+
+# if use IP address, change /CN=xx.xx.xx.xx
+# and subjectAltName=IP:xx.xx.xx.xx
